@@ -198,38 +198,72 @@ if cases:
             st.dataframe(pd.DataFrame(missing_rows), use_container_width=True, hide_index=True)
 
 st.markdown("## 02  Connect to Oracle APEX")
-st.caption("Sign in manually in the Chrome window. TestPulse does not request or store your APEX password.")
-st.session_state.app_url = st.text_input("Oracle APEX application URL", value=st.session_state.app_url)
-sc1, sc2, sc3 = st.columns([1, 1, 2])
+
+st.caption("Enter your Oracle APEX credentials to connect automatically.")
+
+st.session_state.app_url = st.text_input(
+    "Oracle APEX application URL",
+    value=st.session_state.app_url
+)
+
+apex_username = st.text_input(
+    "APEX Username",
+    key="apex_username",
+    placeholder="Enter your APEX username"
+)
+
+apex_password = st.text_input(
+    "APEX Password",
+    key="apex_password",
+    type="password",
+    placeholder="Enter your APEX password"
+)
+
+login_clicked = st.button(
+    "🔐 Sign in to Oracle APEX",
+    type="primary",
+    use_container_width=True
+)
+
+if login_clicked:
+    if not st.session_state.app_url.strip().startswith(("https://", "http://")):
+        st.error("Enter a valid Oracle APEX application URL.")
+    elif not apex_username.strip() or not apex_password:
+        st.error("Enter both your APEX username and password.")
+    else:
+        with st.spinner("Signing in to Oracle APEX..."):
+            try:
+                answer = open_login_session(
+                    app_url=st.session_state.app_url.strip(),
+                    username=apex_username.strip(),
+                    password=apex_password,
+                    show_browser=True,
+                    timeout_seconds=60
+                )
+                st.success(answer["message"])
+                st.rerun()
+            except Exception as exc:
+                st.error(f"APEX sign-in failed: {exc}")
+
+sc1, sc2 = st.columns([1, 2])
+
 with sc1:
-    login_clicked = st.button("🔐 Open Chrome & sign in", type="primary", use_container_width=True)
-with sc2:
     if st.button("Clear saved session", use_container_width=True):
         clear_saved_session()
-        st.success("Saved local browser session cleared.")
+        st.success("Saved browser session cleared.")
         st.rerun()
-with sc3:
+
+with sc2:
     if SESSION_FILE.exists() and STORAGE_STATE_FILE.exists():
         try:
-            session_info = json.loads(SESSION_FILE.read_text(encoding="utf-8"))
-            st.success(f"Saved browser session found · {session_info.get('saved_at', 'time unavailable')}")
+            info = json.loads(SESSION_FILE.read_text(encoding="utf-8"))
+            st.success(
+                f"Saved session found: {info.get('authenticated_url', 'URL unavailable')}"
+            )
         except Exception:
             st.success("Saved browser session files found.")
     else:
         st.warning("Sign in before running browser tests.")
-if login_clicked:
-    if not st.session_state.app_url.strip().startswith(("https://", "http://")):
-        st.error("Enter a valid http/https application URL.")
-    else:
-        st.info("Chrome will open. Complete sign-in manually, then open Employee Timesheet. Keep this dashboard open.")
-        with st.spinner("Waiting for Employee Timesheet..."):
-            try:
-                answer = open_login_session(st.session_state.app_url.strip(), show_browser=True, timeout_seconds=300)
-                st.success(answer["message"])
-                st.rerun()
-            except Exception as exc:
-                st.error(f"Sign-in was not confirmed: {exc}")
-
 st.markdown("## 03  Execute test plan")
 if cases:
     all_ids = [str(c.get("Test Case ID", "")) for c in cases]

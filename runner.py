@@ -103,31 +103,78 @@ def _go_timesheet(page, logs=None):
     return _on_timesheet(page)
 
 
-def open_login_session(app_url=DEFAULT_APP_URL, show_browser=True, timeout_seconds=300):
-    """Connect TestPulse to the existing Chrome session."""
+def open_login_session(
+    app_url=DEFAULT_APP_URL,
+    username="",
+    password="",
+    show_browser=True,
+    timeout_seconds=60
+):
+    """Sign in to Oracle APEX using credentials supplied by TestPulse."""
 
-    if not show_browser:
-        raise RuntimeError("Enable 'Show browser window' to connect to Chrome.")
+    if not username.strip() or not password:
+        raise RuntimeError("Enter your APEX username and password.")
 
     with sync_playwright() as p:
-        browser = p.chromium.connect_over_cdp("http://localhost:9222")
-        context = browser.contexts[0] if browser.contexts else browser.new_context()
+        browser = p.chromium.connect_over_cdp(
+            "http://localhost:9222"
+        )
+
+        if not browser.contexts:
+            raise RuntimeError("No Chrome context found on port 9222.")
+
+        context = browser.contexts[0]
+        pages = context.pages
+        page = pages[0] if pages else context.new_page()
 
         try:
-            pages = context.pages
-            page = pages[0] if pages else context.new_page()
-
             page.goto(
                 app_url,
                 wait_until="domcontentloaded",
                 timeout=60000
             )
+            page.wait_for_timeout(1000)
+
+            password_field = page.locator(
+                "input[type='password']"
+            ).first
+
+            if password_field.is_visible(timeout=3000):
+                username_field = page.locator(
+                    "input[autocomplete='username'], "
+                    "input[name*='USERNAME' i], "
+                    "input[id*='USERNAME' i], "
+                    "input[type='email'], "
+                    "input[type='text']"
+                ).first
+
+                if not username_field.is_visible():
+                    raise RuntimeError(
+                        "Could not identify the APEX username field."
+                    )
+
+                username_field.fill(username)
+                password_field.fill(password)
+
+                submit = page.get_by_role(
+                    "button",
+                    name=re.compile(r"sign in|log in|login|submit", re.I)
+                )
+
+                if submit.count() > 0 and submit.first.is_visible():
+                    submit.first.click()
+                else:
+                    password_field.press("Enter")
 
             started = time.monotonic()
 
             while time.monotonic() - started < timeout_seconds:
+                page.wait_for_timeout(1000)
+
                 if _on_timesheet(page):
-                    context.storage_state(path=str(STORAGE_STATE_FILE))
+                    context.storage_state(
+                        path=str(STORAGE_STATE_FILE)
+                    )
 
                     SESSION_FILE.write_text(
                         json.dumps({
@@ -142,20 +189,18 @@ def open_login_session(app_url=DEFAULT_APP_URL, show_browser=True, timeout_secon
 
                     return {
                         "ok": True,
-                        "message": "Connected to Chrome; session saved.",
+                        "message": "APEX login successful. Session saved.",
                         "authenticated_url": page.url
                     }
 
-                page.wait_for_timeout(1000)
-
             raise RuntimeError(
-                "Employee Timesheet was not detected in the connected Chrome."
+                "Login was not confirmed. Check your credentials, "
+                "login page, or any MFA/SSO prompt."
             )
 
         finally:
-            # Do not close the user's existing Chrome browser.
+            # Keep the user's existing Chrome window open.
             pass
-
 def clear_saved_session():
     SESSION_FILE.unlink(missing_ok=True); STORAGE_STATE_FILE.unlink(missing_ok=True)
 
@@ -380,18 +425,50 @@ def _scenario(page,case,cfg,logs):
         _navigate_week(page,date.today(),logs);_search_project(page,cfg["project_name"],logs);return "PASS",f"Project '{cfg['project_name']}' was found."
 
 
+
     if key == "old_entry":
         target = date.today() - timedelta(days=21)
 
+        # Navigate to the historical week without searching for a project.
         _navigate_week(page, target, logs)
-        _search_project(page, cfg["project_name"], logs)
 
-        # Try opening the old date, but don't fail immediately if
-        # the application displays a Read-Only Week popup instead.
-        try:
-            _open_cell(page, cfg["project_name"], target, logs)
-        except Exception as exc:
-            _log(logs, f"Cell/modal opening did not complete: {exc}")
+        # Click a date cell in the timesheet grid to trigger the restriction.
+        weekday_index = target.weekday()
+        cell_index = weekday_index + 1
+        clicked = False
+
+        rows = page.locator("table tbody tr")
+
+        for row_index in range(rows.count()):
+            row = rows.nth(row_index)
+
+            try:
+                if not row.is_visible():
+                    continue
+
+                cells = row.locator("td")
+
+                if cells.count() <= cell_index:
+                    continue
+
+                cell = cells.nth(cell_index)
+
+                if cell.is_visible():
+                    cell.click(timeout=5000)
+                    clicked = True
+                    _log(
+                        logs,
+                        f"Clicked a timesheet date cell for {target:%d %b %Y}."
+                    )
+                    break
+
+            except Exception as exc:
+                _log(logs, f"Skipping a grid row: {exc}")
+
+        if not clicked:
+            raise RuntimeError(
+                "Could not find a date cell to trigger the Read-Only Week popup."
+            )
 
         page.wait_for_timeout(1000)
 
@@ -404,7 +481,7 @@ def _scenario(page,case,cfg,logs):
         popup_closed = False
         popup_text = ""
 
-        # Check the main page and every iframe for the popup.
+        # Detect the popup and click Got it.
         for frame in page.frames:
             try:
                 body_text = frame.locator("body").inner_text(timeout=3000)
@@ -425,8 +502,9 @@ def _scenario(page,case,cfg,logs):
 
                         if button.is_visible():
                             button.click(timeout=5000)
+                            page.wait_for_timeout(500)
                             popup_closed = True
-                            _log(logs, "Read-Only Week popup closed using Got it.")
+                            _log(logs, "Clicked Got it to close the Read-Only Week popup.")
                             break
 
                     break
@@ -436,23 +514,24 @@ def _scenario(page,case,cfg,logs):
 
         if not popup_found:
             raise RuntimeError(
-                "Neither the Read-Only Week popup nor its expected message was detected."
+                "The Read-Only Week popup was not detected after clicking the date cell."
             )
 
         if not any(message in popup_text for message in expected_messages):
             raise RuntimeError(
-                "Read-Only Week popup appeared, but its message did not match."
+                "The popup appeared, but its message did not match the expected restriction."
             )
 
         if not popup_closed:
             raise RuntimeError(
-                "Read-Only Week popup was detected, but its Got it button was not closed."
+                "The popup was detected, but the Got it button was not clicked."
             )
 
-        _log(logs, f"Verified read-only restriction for {target}.")
+        _log(logs, f"Verified the read-only restriction for {target:%d %b %Y}.")
+
         return "PASS", (
-            f"Read-only restriction verified for {target}; "
-            "the popup was closed using Got it."
+            f"Read-only restriction verified for {target:%d %b %Y}; "
+            "Got it was clicked and the popup was closed."
         )
 
     
