@@ -1,0 +1,26 @@
+# Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Secrets and local browser authentication (NEVER commit these)
+.env
+apex_test_session.json
+apex_storage_state.json
+playwright/.auth/
+user-data-dir/
+
+# Local evidence and generated exports
+test_evidence/*
+!test_evidence/.gitkeep
+*.webm
+*.png
+novatest_results.*
+timesheet_test_results.*
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/

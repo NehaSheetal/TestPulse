@@ -1,0 +1,6 @@
+streamlit>=1.39
+pandas>=2.2
+openpyxl>=3.1
+playwright>=1.50
+psycopg[binary]>=3.2
+python-dotenv>=1.0
