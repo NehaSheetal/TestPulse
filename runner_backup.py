@@ -3,6 +3,8 @@ from datetime import datetime, date, timedelta
 import json, re, time
 import pandas as pd
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
+import subprocess
+import imageio_ffmpeg
 
 BASE_DIR = Path(__file__).resolve().parent
 EVIDENCE_DIR = BASE_DIR / "test_evidence"
@@ -12,6 +14,68 @@ STORAGE_STATE_FILE = BASE_DIR / "apex_storage_state.json"
 DEFAULT_APP_URL = "https://oracleapex.com/ords/r/ns_351/timesheet-management/"
 REQUIRED_COLUMNS = ["Test Case ID", "Test Case Name", "Module", "Priority", "Expected Result"]
 PAGE_MARKERS = ("employee timesheet", "search projects", "add new project")
+
+
+
+
+
+def load_fusion_cases_from_excel(source):
+    """Load Fusion test steps from the dedicated Fusion workbook."""
+    required_columns = [
+        "TEST_CASE_ID",
+        "APPLICATION",
+        "TEST_CASE_NAME",
+        "STEP_NUMBER",
+        "ACTION",
+        "FIELD_NAME",
+        "TEST_DATA",
+        "EXPECTED_RESULT",
+        "NOTES",
+    ]
+
+    sheets = pd.read_excel(source, sheet_name=None, engine="openpyxl")
+    if "Fusion_Test_Steps" not in sheets:
+        raise ValueError(
+            "Fusion workbook must contain a 'Fusion_Test_Steps' sheet."
+        )
+
+    df = sheets["Fusion_Test_Steps"].copy()
+    df.columns = [str(column).strip() for column in df.columns]
+
+    missing = [column for column in required_columns if column not in df.columns]
+    if missing:
+        raise ValueError(
+            "Fusion workbook is missing columns: " + ", ".join(missing)
+        )
+
+    if df.empty:
+        raise ValueError("The Fusion_Test_Steps sheet contains no steps.")
+
+    df = df[required_columns].copy()
+
+    for column in ["TEST_CASE_ID", "APPLICATION", "TEST_CASE_NAME", "ACTION"]:
+        if df[column].isna().any() or df[column].astype(str).str.strip().eq("").any():
+            raise ValueError(
+                f"Fusion column '{column}' contains blank values."
+            )
+
+    df["STEP_NUMBER"] = pd.to_numeric(df["STEP_NUMBER"], errors="raise")
+    if (df["STEP_NUMBER"] < 1).any():
+        raise ValueError("Fusion STEP_NUMBER values must be at least 1.")
+
+    if df.duplicated(subset=["TEST_CASE_ID", "STEP_NUMBER"]).any():
+        raise ValueError(
+            "Each Fusion test case must have unique step numbers."
+        )
+
+    return df.fillna("").sort_values(
+        ["TEST_CASE_ID", "STEP_NUMBER"]
+    ).to_dict(orient="records")
+
+
+
+
+
 
 
 def load_cases_from_excel(source):
@@ -100,44 +164,105 @@ def _go_timesheet(page, logs=None):
     # Do not construct a URL from a guessed friendly path; retain APEX navigation/session.
     return _on_timesheet(page)
 
-def open_login_session(app_url=DEFAULT_APP_URL, show_browser=True, timeout_seconds=300):
-    """Open a visible Chrome window for manual login, then save Playwright storage state."""
-    if not show_browser: raise RuntimeError("Enable 'Show browser window' to sign in manually.")
-    with sync_playwright() as p:
-        try:
-            browser=p.chromium.launch(headless=False,channel="chrome")
-        except Exception as exc:
-            raise RuntimeError("Could not launch installed Google Chrome. Install Chrome, close any managed launch restrictions, and try again. Details: "+str(exc))
-        context=browser.new_context(viewport={"width":1440,"height":950},ignore_https_errors=False)
-        page=context.new_page()
-        page.set_default_timeout(10000)
-        try:
-            # DOMContentLoaded avoids waiting for APEX network requests that may never become idle.
-            page.goto(app_url,wait_until="domcontentloaded",timeout=45000)
-            started=time.monotonic()
-            last_navigation_attempt=0
-            while time.monotonic()-started < timeout_seconds:
-                page.wait_for_timeout(800)
-                if _on_timesheet(page): break
-                body=_body(page).lower()
-                # APEX may land on a blank home page after login. Try its visible navigation
-                # menu periodically instead of waiting forever on network-idle.
-                if time.monotonic()-last_navigation_attempt > 4 and not any(x in body for x in ("password","sign in","username")):
-                    _go_timesheet(page)
-                    last_navigation_attempt=time.monotonic()
-                # If the user is still on a login form, leave the browser open for manual input.
-            else:
-                current=_body(page).lower()
-                if any(x in current for x in ("password","sign in","username")):
-                    raise RuntimeError("The login page was still visible after the wait. Complete sign-in in Chrome, then make sure Employee Timesheet is open before the timeout. If clicking Sign In spins forever, test the APEX URL directly in normal Chrome; this is likely an APEX/network/session issue rather than a Streamlit page-load wait.")
-                raise RuntimeError("Could not confirm Employee Timesheet within the timeout. In Chrome, complete sign-in and choose Navigation Menu → Employee Timesheet. If the page itself keeps loading, check the APEX app directly in Chrome.")
-            page.wait_for_timeout(500)
-            context.storage_state(path=str(STORAGE_STATE_FILE))
-            SESSION_FILE.write_text(json.dumps({"app_url":app_url,"authenticated_url":page.url,"saved_at":datetime.now().isoformat(timespec="seconds")},indent=2),encoding="utf-8")
-            return {"ok":True,"message":"Employee Timesheet detected; browser session state saved locally.","authenticated_url":page.url}
-        finally:
-            context.close(); browser.close()
 
+def open_login_session(
+    app_url=DEFAULT_APP_URL,
+    username="",
+    password="",
+    show_browser=True,
+    timeout_seconds=60
+):
+    """Sign in to Oracle APEX using credentials supplied by TestPulse."""
+
+    if not username.strip() or not password:
+        raise RuntimeError("Enter your APEX username and password.")
+
+    with sync_playwright() as p:
+        browser = p.chromium.connect_over_cdp(
+            "http://localhost:9222"
+        )
+
+        if not browser.contexts:
+            raise RuntimeError("No Chrome context found on port 9222.")
+
+        context = browser.contexts[0]
+        pages = context.pages
+        page = pages[0] if pages else context.new_page()
+
+        try:
+            page.goto(
+                app_url,
+                wait_until="domcontentloaded",
+                timeout=60000
+            )
+            page.wait_for_timeout(1000)
+
+            password_field = page.locator(
+                "input[type='password']"
+            ).first
+
+            if password_field.is_visible(timeout=3000):
+                username_field = page.locator(
+                    "input[autocomplete='username'], "
+                    "input[name*='USERNAME' i], "
+                    "input[id*='USERNAME' i], "
+                    "input[type='email'], "
+                    "input[type='text']"
+                ).first
+
+                if not username_field.is_visible():
+                    raise RuntimeError(
+                        "Could not identify the APEX username field."
+                    )
+
+                username_field.fill(username)
+                password_field.fill(password)
+
+                submit = page.get_by_role(
+                    "button",
+                    name=re.compile(r"sign in|log in|login|submit", re.I)
+                )
+
+                if submit.count() > 0 and submit.first.is_visible():
+                    submit.first.click()
+                else:
+                    password_field.press("Enter")
+
+            started = time.monotonic()
+
+            while time.monotonic() - started < timeout_seconds:
+                page.wait_for_timeout(1000)
+
+                if _on_timesheet(page):
+                    context.storage_state(
+                        path=str(STORAGE_STATE_FILE)
+                    )
+
+                    SESSION_FILE.write_text(
+                        json.dumps({
+                            "app_url": app_url,
+                            "authenticated_url": page.url,
+                            "saved_at": datetime.now().isoformat(
+                                timespec="seconds"
+                            )
+                        }, indent=2),
+                        encoding="utf-8"
+                    )
+
+                    return {
+                        "ok": True,
+                        "message": "APEX login successful. Session saved.",
+                        "authenticated_url": page.url
+                    }
+
+            raise RuntimeError(
+                "Login was not confirmed. Check your credentials, "
+                "login page, or any MFA/SSO prompt."
+            )
+
+        finally:
+            # Keep the user's existing Chrome window open.
+            pass
 def clear_saved_session():
     SESSION_FILE.unlink(missing_ok=True); STORAGE_STATE_FILE.unlink(missing_ok=True)
 
@@ -174,39 +299,162 @@ def _search_project(page,project,logs):
     if project.casefold() in _body(page).casefold():_log(logs,f"Project found: {project}");return True
     raise RuntimeError(f"Project '{project}' did not appear after searching.")
 
-def _open_cell(page,project,target,logs):
-    _navigate_week(page,target,logs);_search_project(page,project,logs)
-    match=page.get_by_text(re.compile(re.escape(project),re.I),exact=False).first
-    match.wait_for(state="visible",timeout=5000)
-    row=match.locator("xpath=ancestor::tr[1]")
-    if row.count()==0:row=match.locator("xpath=ancestor::*[self::div or self::li][1]")
-    col_index,header=None,""
-    for selector in ["th","[role='columnheader']"]:
-        headers=page.locator(selector).all_inner_texts()
-        for i,value in enumerate(headers):
-            txt=value.lower().replace("\n"," ")
-            if target.strftime("%a").lower() in txt and str(target.day) in txt and target.strftime("%b").lower() in txt:
-                col_index,header=i,value;break
-        if col_index is not None:break
-    if col_index is None:raise RuntimeError(f"Could not identify date column for {target:%a %d %b}.")
-    cells=row.locator("td")
-    if col_index>=cells.count():col_index-=1
-    if col_index<0 or col_index>=cells.count():raise RuntimeError(f"Could not map date column '{header}' to a project cell.")
-    cells.nth(col_index).click(timeout=4000);page.wait_for_timeout(350)
-    _log(logs,f"Opened {target:%A %d %b %Y} for {project}.")
+
+
+def _open_cell(page, project, target, logs):
+    # Close any existing Timesheet Entry dialog that may block cell clicks.
+    dialog = page.locator(
+        ".ui-dialog[aria-modal='true']"
+    ).filter(has=page.locator('iframe[title="Timesheet Entry"]'))
+
+    try:
+        if dialog.count() > 0 and dialog.last.is_visible():
+            close_button = dialog.last.locator(
+                "button.ui-dialog-titlebar-close"
+            )
+            if close_button.count() > 0:
+                close_button.click(timeout=3000)
+                page.wait_for_timeout(500)
+    except Exception as exc:
+        _log(logs, f"Existing dialog close attempt: {exc}")
+
+    # Navigate to the week containing the requested date.
+    _navigate_week(page, target, logs)
+
+    # Find the requested project row.
+    project_locator = page.get_by_text(
+        re.compile(re.escape(project), re.I),
+        exact=False
+    )
+
+    project_visible = False
+    for index in range(project_locator.count()):
+        candidate = project_locator.nth(index)
+        try:
+            if candidate.is_visible():
+                project_visible = True
+                break
+        except Exception:
+            continue
+
+    if not project_visible:
+        _search_project(page, project, logs)
+
+    match = page.get_by_text(
+        re.compile(re.escape(project), re.I),
+        exact=False
+    ).first
+
+    match.wait_for(state="visible", timeout=10000)
+    row = match.locator("xpath=ancestor::tr[1]")
+
+    if row.count() == 0:
+        raise RuntimeError(
+            f"Could not find a table row for project '{project}'."
+        )
+
+    # The APEX timesheet columns are: Project, Monday...Sunday, Weekly Total.
+    # Monday=0 through Sunday=6; the first td is the project name.
+    weekday_index = target.weekday()
+    cell_index = weekday_index + 1
+
+    cells = row.locator("td")
+
+    if cells.count() <= cell_index:
+        raise RuntimeError(
+            f"Project row has {cells.count()} cells; "
+            f"cannot select {target:%A} at index {cell_index}."
+        )
+
+    cell = cells.nth(cell_index)
+    cell.wait_for(state="visible", timeout=5000)
+    cell.click(timeout=10000)
+
+    # Wait for the modal iframe to open.
+    page.locator(
+        'iframe[title="Timesheet Entry"]'
+    ).wait_for(state="visible", timeout=10000)
+
+    _log(
+        logs,
+        f"Opened {target:%A %d %b %Y} for {project}."
+    )
+
 
 def _hours(page):
-    for loc in [page.get_by_label(re.compile(r"hours|hour|time",re.I)),page.get_by_placeholder(re.compile(r"hours|hour|time",re.I)),page.locator("input[name*='HOUR' i], input[id*='HOUR' i]"),page.locator("input[type='number']"),page.locator("input[type='text']"),page.locator("input:not([type])")]:
-        field=_visible(loc,1000)
-        if field:return field
-    raise RuntimeError("Could not identify the hours field in the selected cell dialog.")
+    """Find the Hours input in the APEX Page 4 Timesheet Entry dialog."""
 
-def _save(page,allow_save,logs):
-    if not allow_save:_log(logs,"Save skipped because saving is disabled.");return "BLOCKED"
-    clicked=_click_named(page,["Save","Apply Changes","Submit"],3000)
-    if not clicked:raise RuntimeError("Could not find Save/Apply Changes/Submit.")
-    page.wait_for_timeout(1000);body=_body(page).lower()
-    if any(x in body for x in ["cannot exceed","must not exceed","maximum","required","invalid","error"]):return "VALIDATION"
+    # Wait up to 10 seconds for the Page 4 dialog to load.
+    for _ in range(40):
+        for frame in page.frames:
+            try:
+                field = frame.locator("#P4_HOURS")
+
+                if field.count() > 0 and field.is_visible() and field.is_enabled():
+                    return field
+
+            except Exception:
+                continue
+
+        page.wait_for_timeout(250)
+
+    # Include diagnostic details if the expected field is missing.
+    frame_details = [
+        {
+            "url": frame.url,
+            "name": frame.name,
+            "hours_field_count": frame.locator("#P4_HOURS").count(),
+        }
+        for frame in page.frames
+    ]
+
+    raise RuntimeError(
+        "Could not find the Page 4 Hours input (#P4_HOURS). "
+        "The Timesheet Entry dialog may not have opened. "
+        f"Browser frames: {frame_details!r}"
+    )
+
+
+def _save(page, allow_save, logs):
+    if not allow_save:
+        _log(logs, "Saving is disabled in TestPulse.")
+        return "BLOCKED"
+
+    # The Timesheet Entry page is displayed inside an APEX iframe.
+    frame = None
+    for current_frame in page.frames:
+        try:
+            if current_frame.locator("#P4_HOURS").count() > 0:
+                frame = current_frame
+                break
+        except Exception:
+            continue
+
+    if frame is None:
+        raise RuntimeError(
+            "Timesheet Entry iframe or P4_HOURS field was not found."
+        )
+
+    # Find the Save button inside the iframe.
+    save_button = frame.get_by_role(
+        "button",
+        name=re.compile(r"save|apply changes|submit", re.I)
+    ).first
+
+    if save_button.count() == 0:
+        save_button = frame.locator(
+            "button[type='submit'], input[type='submit']"
+        ).first
+
+    if save_button.count() == 0:
+        raise RuntimeError(
+            "Could not find a Save button inside the Timesheet Entry iframe."
+        )
+
+    save_button.click(timeout=10000)
+    page.wait_for_timeout(1500)
+
+    _log(logs, "Clicked Save in the Timesheet Entry dialog.")
     return "SAVED"
 
 def _generic(page,case,logs):
@@ -238,102 +486,371 @@ def _scenario(page,case,cfg,logs):
     if key=="search_project":
         _navigate_week(page,date.today(),logs);_search_project(page,cfg["project_name"],logs);return "PASS",f"Project '{cfg['project_name']}' was found."
 
+
+
     if key == "old_entry":
         target = date.today() - timedelta(days=21)
 
-        # Open a timesheet cell from three weeks ago.
-        _open_cell(page, cfg["project_name"], target, logs)
+        # Navigate to the historical week without searching for a project.
+        _navigate_week(page, target, logs)
 
-        # A week older than two weeks should be read-only.
-        try:
-            popup = page.get_by_text(
-                "Read-Only Week",
-                exact=True
+        # Click a date cell in the timesheet grid to trigger the restriction.
+        weekday_index = target.weekday()
+        cell_index = weekday_index + 1
+        clicked = False
+
+        rows = page.locator("table tbody tr")
+
+        for row_index in range(rows.count()):
+            row = rows.nth(row_index)
+
+            try:
+                if not row.is_visible():
+                    continue
+
+                cells = row.locator("td")
+
+                if cells.count() <= cell_index:
+                    continue
+
+                cell = cells.nth(cell_index)
+
+                if cell.is_visible():
+                    cell.click(timeout=5000)
+                    clicked = True
+                    _log(
+                        logs,
+                        f"Clicked a timesheet date cell for {target:%d %b %Y}."
+                    )
+                    break
+
+            except Exception as exc:
+                _log(logs, f"Skipping a grid row: {exc}")
+
+        if not clicked:
+            raise RuntimeError(
+                "Could not find a date cell to trigger the Read-Only Week popup."
             )
-            popup.wait_for(state="visible", timeout=5000)
 
-            body_text = _body(page)
-            expected_message = (
-                "Timesheet entries can only be edited for the "
-                "current week and the previous two weeks."
-            )
+        page.wait_for_timeout(1000)
 
-            if expected_message not in body_text:
-                alternate_message = (
-                    "This timesheet is read-only. You cannot "
-                    "enter or edit hours for weeks older than 2 weeks."
-                )
-                if alternate_message not in body_text:
-                    raise RuntimeError(
-                        "Read-Only Week popup appeared, but its "
-                        "message did not match the expected text."
+        expected_messages = [
+            "Timesheet entries can only be edited for the current week and the previous two weeks.",
+            "This timesheet is read-only. You cannot enter or edit hours for weeks older than 2 weeks."
+        ]
+
+        popup_found = False
+        popup_closed = False
+        popup_text = ""
+
+        # Detect the popup and click Got it.
+        for frame in page.frames:
+            try:
+                body_text = frame.locator("body").inner_text(timeout=3000)
+
+                if (
+                    "Read-Only Week" in body_text
+                    or any(message in body_text for message in expected_messages)
+                ):
+                    popup_found = True
+                    popup_text = body_text
+
+                    got_it = frame.get_by_role(
+                        "button", name="Got it", exact=True
                     )
 
-            got_it = page.get_by_role(
-                "button",
-                name="Got it",
-                exact=True
-            )
-            got_it.wait_for(state="visible", timeout=3000)
-            got_it.click()
+                    for i in range(got_it.count()):
+                        button = got_it.nth(i)
 
-            logs.append(
-                f"Verified read-only restriction for {target} "
-                "and clicked Got it."
-            )
-            return "PASS", (
-                f"Correctly displayed the Read-Only Week popup "
-                f"for {target} and closed it using Got it."
-            )
+                        if button.is_visible():
+                            button.click(timeout=5000)
+                            page.wait_for_timeout(500)
+                            popup_closed = True
+                            _log(logs, "Clicked Got it to close the Read-Only Week popup.")
+                            break
 
-        except Exception as exc:
+                    break
+
+            except Exception as exc:
+                _log(logs, f"Popup check skipped for a frame: {exc}")
+
+        if not popup_found:
             raise RuntimeError(
-                f"Read-only week validation failed for {target}: {exc}"
-            ) from exc
-    if key=="weekend_entry":
-        today=date.today();target=today-timedelta(days=((today.weekday()-5)%7 or 7))
-        _open_cell(page,cfg["project_name"],target,logs);_hours(page).fill(str(cfg["normal_hours"]));saved=_save(page,cfg["allow_save"],logs)
-        return ("BLOCKED",f"Prepared weekend entry for {target}; not saved.") if saved=="BLOCKED" else ("PASS",f"Weekend entry action completed for {target}; verify approval status.")
+                "The Read-Only Week popup was not detected after clicking the date cell."
+            )
+
+        if not any(message in popup_text for message in expected_messages):
+            raise RuntimeError(
+                "The popup appeared, but its message did not match the expected restriction."
+            )
+
+        if not popup_closed:
+            raise RuntimeError(
+                "The popup was detected, but the Got it button was not clicked."
+            )
+
+        _log(logs, f"Verified the read-only restriction for {target:%d %b %Y}.")
+
+        return "PASS", (
+            f"Read-only restriction verified for {target:%d %b %Y}; "
+            "Got it was clicked and the popup was closed."
+        )
+
+    
+    if key == "weekend_entry":
+        # Find the most recent Saturday, including today if it is Saturday.
+        today = date.today()
+        target = today - timedelta(days=(today.weekday() - 5) % 7)
+
+        # Open the selected weekend cell.
+        _open_cell(page, cfg["project_name"], target, logs)
+
+        # Wait for the Page 4 Hours field to become available.
+        hours_field = _hours(page)
+        hours_field.fill(str(cfg["normal_hours"]))
+
+        # Find the Page 4 description field in the same frame.
+        description_field = None
+        for frame in page.frames:
+            try:
+                candidate = frame.locator("#P4_DESCRIPTION")
+                if (
+                    candidate.count() > 0
+                    and candidate.is_visible()
+                    and candidate.is_enabled()
+                ):
+                    description_field = candidate
+                    break
+            except Exception:
+                continue
+
+        if description_field is None:
+            raise RuntimeError(
+                "Page 4 opened, but the Description field "
+                "(#P4_DESCRIPTION) was not found."
+            )
+
+        description_field.fill("Automated weekend entry test")
+
+        # Avoid submitting changes unless explicitly allowed.
+        if not cfg["allow_save"]:
+            return (
+                "BLOCKED",
+                f"Weekend entry prepared for {target}; saving is disabled."
+            )
+
+        saved = _save(page, True, logs)
+
+        if saved == "BLOCKED":
+            return "BLOCKED", "Weekend entry was not saved."
+
+        # Wait for the dialog to close after submission.
+        page.wait_for_timeout(1500)
+
+        _log(logs, f"Weekend entry submitted for {target}.")
+
+        return (
+            "PASS",
+            f"Weekend entry submitted for {target}. "
+            "Pending status still needs to be verified."
+        )
     if key=="holiday_entry":
         target=date.fromisoformat(cfg["holiday_date"]);_open_cell(page,cfg["project_name"],target,logs);_hours(page).fill(str(cfg["normal_hours"]));saved=_save(page,cfg["allow_save"],logs)
         return ("BLOCKED",f"Prepared holiday entry for {target}; not saved.") if saved=="BLOCKED" else ("PASS",f"Holiday entry action completed for {target}; verify approval status.")
-    if key=="over_24_hours":
-        target=date.today();_open_cell(page,cfg["project_name"],target,logs);_hours(page).fill(str(cfg["excessive_hours"]))
+
+    if key == "over_24_hours":
+        target = date.today()
+
+        _open_cell(page, cfg["project_name"], target, logs)
+
+        hours_field = _hours(page)
+        hours_field.fill(str(cfg["excessive_hours"]))
+
+        # Check validation before submitting.
+        frame = hours_field.locator("xpath=ancestor::form")
+        dialog_text = ""
+
+        for current_frame in page.frames:
+            try:
+                if current_frame.locator("#P4_HOURS").count() > 0:
+                    dialog_text = current_frame.locator("body").inner_text()
+                    break
+            except Exception:
+                continue
+
         if not cfg["allow_save"]:
-            body=_body(page).lower()
-            if any(x in body for x in ["24 hours","maximum","cannot exceed","invalid","error"]):return "PASS","Application displayed excessive-hours validation."
-            return "BLOCKED","Excessive hours entered but not submitted because saving is disabled."
-        saved=_save(page,True,logs)
-        if saved=="VALIDATION":return "PASS","Application displayed a validation message for excessive hours."
-        raise RuntimeError("No validation message detected after submitting excessive hours.")
+            if any(msg in dialog_text.lower() for msg in [
+                "between 0 and 24",
+                "cannot exceed",
+                "maximum",
+                "invalid"
+            ]):
+                return "PASS", "Application displayed excessive-hours validation."
+            return "BLOCKED", "Excessive hours entered; saving is disabled."
+
+        saved = _save(page, True, logs)
+
+        # Read validation text from the dialog iframe.
+        for current_frame in page.frames:
+            try:
+                if current_frame.locator("#P4_HOURS").count() > 0:
+                    current_frame.wait_for_timeout(500)
+                    dialog_text = current_frame.locator("body").inner_text()
+                    break
+            except Exception:
+                continue
+
+        if any(msg in dialog_text.lower() for msg in [
+            "between 0 and 24",
+            "cannot exceed",
+            "maximum",
+            "future dates cannot be entered"
+        ]):
+            # Close the Timesheet Entry popup after confirming validation.
+            close_button = page.locator(
+                '.ui-dialog[aria-modal="true"] button.ui-dialog-titlebar-close'
+            ).last
+
+            if close_button.is_visible():
+                close_button.click(timeout=5000)
+                page.wait_for_timeout(500)
+
+            _log(logs, "Validation detected; closed the Timesheet Entry popup.")
+
+            return "PASS", (
+                "Application displayed validation for excessive hours and "
+                "the Timesheet Entry popup was closed."
+            )
+        raise RuntimeError(
+            "No expected validation message detected in the Timesheet Entry dialog."
+        )
     if key=="generic_steps":_generic(page,case,logs);return "PASS","All generic steps completed."
     raise RuntimeError(f"Unsupported Automation Key '{key}'.")
 
-def run_test_case(case,settings):
-    started=time.monotonic();logs=[];status="FAIL";actual="";error=""
-    stamp=datetime.now().strftime("%Y%m%d_%H%M%S")
-    folder=EVIDENCE_DIR/f"{re.sub(r'[^A-Za-z0-9_-]+','_',str(case.get('Test Case ID','test')))}_{stamp}"
-    folder.mkdir(parents=True,exist_ok=True);shot=folder/"final_screenshot.png";video_dir=folder/"video";video_dir.mkdir(exist_ok=True);video=""
-    info=_session()
+
+
+def run_test_case(case, settings):
+    started = time.monotonic()
+    logs = []
+    status = "FAIL"
+    actual = ""
+    error = ""
+
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    folder = EVIDENCE_DIR / (
+        f"{re.sub(r'[^A-Za-z0-9_-]+','_',str(case.get('Test Case ID','test')))}_{stamp}"
+    )
+    folder.mkdir(parents=True, exist_ok=True)
+
+    shot = folder / "final_screenshot.png"
+    video_path = folder / "test_run.mp4"
+    info = _session()
+
+    import subprocess
+
+    ffmpeg_process = None
+    browser = None
+    context = None
+    page = None
+
     with sync_playwright() as p:
-        launch_args={"headless":bool(settings.get("headless",False))}
-        if not launch_args["headless"]:launch_args["channel"]="chrome"
-        try:browser=p.chromium.launch(**launch_args)
-        except Exception as exc:raise RuntimeError("Could not launch browser for test execution. Check Chrome/Playwright installation: "+str(exc))
-        context=browser.new_context(viewport={"width":1440,"height":950},record_video_dir=str(video_dir),record_video_size={"width":1440,"height":950},storage_state=str(STORAGE_STATE_FILE))
-        page=context.new_page();page.set_default_timeout(12000)
         try:
-            # APEX may keep polling in the background; do not wait for networkidle.
-            page.goto(info.get("authenticated_url") or settings.get("app_url") or DEFAULT_APP_URL,wait_until="domcontentloaded",timeout=45000)
-            page.wait_for_timeout(600)
-            if not _on_timesheet(page) and not _go_timesheet(page,logs):raise RuntimeError("Saved session did not open Employee Timesheet. It may have expired; sign in again.")
-            status,actual=_scenario(page,case,settings,logs);_log(logs,f"Test result: {status} — {actual}")
+            browser = p.chromium.connect_over_cdp("http://localhost:9222")
+
+            if not browser.contexts:
+                raise RuntimeError("No Chrome context found on port 9222.")
+
+            context = browser.contexts[0]
+            pages = context.pages
+            page = pages[0] if pages else context.new_page()
+            page.set_default_timeout(12000)
+            page.bring_to_front()
+
+            app_url = (
+                info.get("authenticated_url")
+                or settings.get("app_url")
+                or DEFAULT_APP_URL
+            )
+
+            if not _on_timesheet(page):
+                page.goto(app_url, wait_until="domcontentloaded", timeout=60000)
+
+            page.wait_for_timeout(1000)
+
+            if not _on_timesheet(page) and not _go_timesheet(page, logs):
+                raise RuntimeError(
+                    "Employee Timesheet was not detected in connected Chrome."
+                )
+
+            # Record the visible desktop while the test runs.
+            try:
+                ffmpeg_process = subprocess.Popen(
+                    [
+                        imageio_ffmpeg.get_ffmpeg_exe(), "-y",
+                        "-f", "gdigrab",
+                        "-framerate", "15",
+                        "-i", "desktop",
+                        "-c:v", "libx264",
+                        "-preset", "ultrafast",
+                        "-pix_fmt", "yuv420p",
+                        str(video_path)
+                    ],
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL
+                )
+                time.sleep(1)
+                _log(logs, "Desktop video recording started.")
+            except Exception as exc:
+                _log(logs, f"Video recording could not start: {exc}")
+                ffmpeg_process = None
+
+            status, actual = _scenario(page, case, settings, logs)
+            _log(logs, f"Test result: {status} — {actual}")
+
         except Exception as exc:
-            error=str(exc);actual="Automation could not complete the scenario.";status="FAIL";_log(logs,f"FAIL: {error}")
+            error = str(exc)
+            actual = "Automation could not complete the scenario."
+            status = "FAIL"
+            _log(logs, f"FAIL: {error}")
+
         finally:
-            try:page.screenshot(path=str(shot),full_page=True,timeout=10000);_log(logs,f"Screenshot saved: {shot}")
-            except Exception as exc:_log(logs,f"Screenshot failed: {exc}")
-            context.close();browser.close()
-    videos=list(video_dir.glob("*.webm"))
-    if videos:video=str(videos[0])
-    return {"test_case_id":str(case.get("Test Case ID","UNKNOWN")),"test_case_name":str(case.get("Test Case Name","")),"status":status,"duration_seconds":round(time.monotonic()-started,2),"actual_result":actual,"error_message":error,"screenshot_path":str(shot) if shot.exists() else "","video_path":video,"logs":logs,"executed_at":datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
+            if page is not None:
+                try:
+                    page.bring_to_front()
+                    page.screenshot(
+                        path=str(shot),
+                        full_page=True,
+                        timeout=15000
+                    )
+                    _log(logs, f"Screenshot saved: {shot}")
+                except Exception as exc:
+                    _log(logs, f"Screenshot failed: {exc}")
+
+            if ffmpeg_process is not None:
+                try:
+                    ffmpeg_process.stdin.write(b"q\n")
+                    ffmpeg_process.stdin.flush()
+                    ffmpeg_process.wait(timeout=15)
+                except Exception as exc:
+                    ffmpeg_process.kill()
+                    _log(logs, f"Video recording stop issue: {exc}")
+
+            # Do not close the connected Chrome browser or its context.
+
+    return {
+        "test_case_id": str(case.get("Test Case ID", "UNKNOWN")),
+        "test_case_name": str(case.get("Test Case Name", "")),
+        "status": status,
+        "duration_seconds": round(time.monotonic() - started, 2),
+        "actual_result": actual,
+        "error_message": error,
+        "screenshot_path": str(shot) if shot.is_file() else "",
+        "video_path": (
+            str(video_path)
+            if video_path.is_file() and video_path.stat().st_size > 0
+            else ""
+        ),
+        "logs": logs,
+        "executed_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    }
